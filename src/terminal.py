@@ -3,7 +3,7 @@ import subprocess
 import os
 
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QMainWindow, QTextEdit, QLineEdit
-from PySide6.QtGui import QFont, QColor
+from PySide6.QtGui import QFont, QColor, QTextCharFormat
 
 class Terminal(QMainWindow):
     def __init__(self):
@@ -23,7 +23,23 @@ class Terminal(QMainWindow):
         self.output.setReadOnly(True)
         self.output.setFont(QFont("Menlo", 13))
         self.output.setStyleSheet("QTextEdit { background-color: #0d0d0d; color: #e0e0e0; border: none; }")
-        self.output.append("Pulse Terminal v0.1 ⚡")
+        # Bold format
+        bold_format = QTextCharFormat()
+        bold_font = QFont("Menlo", 13)
+        bold_font.setBold(True)
+        bold_format.setFont(bold_font)
+        bold_format.setForeground(QColor("#00ff99"))
+
+        cursor = self.output.textCursor()
+        cursor.setCharFormat(bold_format)
+        cursor.insertText("Pulse Terminal v0.1 ⚡\n")
+        self.output.setTextCursor(cursor)
+
+        default_format = QTextCharFormat()
+        default_format.setFont(QFont("Menlo", 13))
+        default_format.setForeground(QColor("#e0e0e0"))
+        cursor.setCharFormat(default_format)
+        self.output.setTextCursor(cursor)
 
         layout.addWidget(self.output)
 
@@ -62,6 +78,11 @@ class Terminal(QMainWindow):
                 self.output.append(f"{cmd} : No such file or directory")
                 self.output.setTextColor(QColor("#e0e0e0"))
 
+            self.input.clear()
+            return
+
+        if cmd == "clear":
+            self.output.clear()
             self.input.clear()
             return
 
