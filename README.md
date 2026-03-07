@@ -1,6 +1,6 @@
 # Pulse Terminal ⚡
 
-A modern, minimal, dark GUI terminal emulator built from scratch in Python using PySide6.
+A modern, minimal, dark GUI terminal built from scratch in Python using PySide6.
 
 ## Features
 - Dark sleek UI with green prompt
