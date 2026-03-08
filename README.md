@@ -2,7 +2,7 @@
 
 A modern, minimal, dark GUI terminal built from scratch in Python using PySide6.
 
-![Pulse Terminal](assets/img.png)
+<img src="assets/img.png" width="600"/>
 
 ## Features
 - Dark sleek UI with green prompt
