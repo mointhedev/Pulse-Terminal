@@ -26,8 +26,30 @@ class Terminal(QMainWindow):
         self.output = QTextEdit()
         self.output.setReadOnly(True)
         self.output.setFont(QFont("Menlo", 13))
-        self.output.setStyleSheet("QTextEdit { background-color: #0d0d0d; color: #e0e0e0; border: none; }")
-        # Bold format
+        self.output.setStyleSheet("""
+            QTextEdit {
+                background-color: #0d0d0d;
+                color: #e0e0e0;
+                border: none;
+            }
+            QScrollBar:vertical {
+                background: #0d0d0d;
+                width: 6px;
+                border-radius: 3px;
+            }
+            QScrollBar::handle:vertical {
+                background: #1a3d2e;
+                border-radius: 3px;
+                min-height: 10px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #00ff99;
+            }
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+        """)
         bold_format = QTextCharFormat()
         bold_font = QFont("Menlo", 13)
         bold_font.setBold(True)
@@ -55,8 +77,8 @@ class Terminal(QMainWindow):
         self.input.returnPressed.connect(self.run_command)
         self.input.installEventFilter(self)
 
-
         layout.addWidget(self.input)
+
 
     def run_command(self):
         cmd = self.input.text().strip()
