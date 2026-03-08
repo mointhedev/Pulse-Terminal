@@ -3,12 +3,16 @@ import subprocess
 import os
 
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QMainWindow, QTextEdit, QLineEdit
-from PySide6.QtGui import QFont, QColor, QTextCharFormat
+from PySide6.QtGui import QFont, QColor, QTextCharFormat, QKeyEvent
+from PySide6.QtCore import Qt, QEvent
+
 
 class Terminal(QMainWindow):
     def __init__(self):
         super().__init__()
         self.cwd = os.path.expanduser("~")
+        self.history = []
+        self.i = 0
 
         self.setWindowTitle("Pulse")
         self.setMinimumSize(400, 300)
@@ -49,18 +53,20 @@ class Terminal(QMainWindow):
             "QLineEdit { background-color: #0d0d0d; color: #00ff99; border: none; border-top: 1px solid #222; padding: 8px; }")
         self.input.setFont(QFont("Menlo", 13))
         self.input.returnPressed.connect(self.run_command)
+        self.input.installEventFilter(self)
+
 
         layout.addWidget(self.input)
 
-
     def run_command(self):
-
         cmd = self.input.text().strip()
 
         if not cmd:
             return
 
         self.output.append(f"> {cmd}")
+        self.history.append(cmd)
+        self.i = len(self.history)
         # Handle cd separately
         if cmd.startswith("cd"):
             parts = cmd.split(maxsplit=1)
@@ -102,5 +108,22 @@ class Terminal(QMainWindow):
             self.output.setTextColor(QColor("#e0e0e0"))
 
         self.input.clear()
+
+    def eventFilter(self, source, event):
+        if source == self.input and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Up:
+                if self.history and self.i > 0:
+                    self.i -= 1
+                    self.input.setText(self.history[self.i])
+                return True
+            elif event.key() == Qt.Key.Key_Down:
+                if self.i < len(self.history) - 1:
+                    self.i += 1
+                    self.input.setText(self.history[self.i])
+                else:
+                    self.i = len(self.history)  # reset past the end
+                    self.input.clear()
+                return True
+        return super().eventFilter(source, event)
 
 
