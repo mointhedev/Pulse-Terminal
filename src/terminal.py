@@ -7,6 +7,8 @@ from PySide6.QtGui import QFont, QColor, QTextCharFormat, QKeyEvent
 from PySide6.QtCore import Qt, QEvent
 import glob
 
+from pulse_overlay import PulseOverlay
+
 class Terminal(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -17,6 +19,8 @@ class Terminal(QMainWindow):
         self.setWindowTitle("Pulse")
         self.setMinimumSize(400, 300)
         self.setStyleSheet("background-color: #0d0d0d;")
+
+
         self.central = QWidget()
         self.setCentralWidget(self.central)
         self.dropdown = QListWidget(self.central)
@@ -61,6 +65,7 @@ class Terminal(QMainWindow):
         self.output = QTextEdit()
         self.output.setReadOnly(True)
         self.output.setFont(QFont("Menlo", 13))
+        self.overlay = PulseOverlay(self.central, self._do_clear)
         self.output.setStyleSheet("""
             QTextEdit {
                 background-color: #0d0d0d;
@@ -146,7 +151,7 @@ class Terminal(QMainWindow):
             return
 
         if cmd == "clear":
-            self.output.clear()
+            self.overlay.play()
             self.input.clear()
             return
 
@@ -287,5 +292,10 @@ class Terminal(QMainWindow):
             parts[-1] = item.text()
         self.input.setText(" ".join(parts))
         self.dropdown.hide()
+
+    def _do_clear(self):
+        self.output.clear()
+        self.output.setTextColor(QColor("#e0e0e0"))
+
 
 
