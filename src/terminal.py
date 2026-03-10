@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt, QEvent
 import glob
 
 from pulse_overlay import PulseOverlay
+from command_thread import CommandThread
 
 class Terminal(QMainWindow):
     def __init__(self):
@@ -15,6 +16,7 @@ class Terminal(QMainWindow):
         self.cwd = os.path.expanduser("~")
         self.history = []
         self.i = 0
+        self.thread = None
 
         self.setWindowTitle("Pulse")
         self.setMinimumSize(400, 300)
@@ -120,14 +122,18 @@ class Terminal(QMainWindow):
 
         layout.addWidget(self.input)
 
-
     def run_command(self):
         cmd = self.input.text().strip()
 
         if not cmd:
             return
 
+        if self.thread and self.thread.isRunning():
+            return
+
+        self.output.setTextColor(QColor("#00ff99"))
         self.output.append(f"> {cmd}")
+        self.output.setTextColor(QColor("#e0e0e0"))
         self.history.append(cmd)
         self.i = len(self.history)
         # Handle cd separately
@@ -155,26 +161,33 @@ class Terminal(QMainWindow):
             self.input.clear()
             return
 
-        result = subprocess.run(
-            cmd,
-            cwd=self.cwd,
-            shell=True,
-            capture_output=True,
-            text=True
-        )
+        self.thread = CommandThread(cmd, self.cwd)
+        self.thread.output_ready.connect(self.handle_output)
+        self.thread.finished.connect(self.on_command_finished)
+        self.thread.start()
+        self.input.clear()  # ← add this
 
-        if result.stdout:
-            self.output.append(result.stdout)
-        if result.stderr:
+    def handle_output(self, text, is_error):
+        if is_error:
             self.output.setTextColor(QColor("#ff4444"))
-            self.output.append(result.stderr)
+            self.output.append(text)
             self.output.setTextColor(QColor("#e0e0e0"))
+        else:
+            self.output.append(text)
 
-        self.input.clear()
+    def on_command_finished(self):
+        self.output.append("")
 
+        self.thread = None
 
     def eventFilter(self, source, event):
         if source == self.input and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_C and (event.modifiers() & Qt.KeyboardModifier.MetaModifier or event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+                if self.thread and self.thread.process:
+                    self.thread.kill()
+                    self.output.append("^C")
+                    return True
+
             if event.key() == Qt.Key.Key_Up:
                 if self.dropdown.isVisible():
                     row = self.dropdown.currentRow()
@@ -247,35 +260,49 @@ class Terminal(QMainWindow):
         self.dropdown.clear()
 
         if not text.strip() or len(text.split()) < 2:
-            self.dropdown.clear()
             self.dropdown.hide()
             return
 
         parts = text.split()
-        last_word = parts[-1] if parts else ""
+        # Rejoin path parts — last word is everything after the command
+        last_word = parts[-1] if len(parts) <= 2 else " ".join(parts[1:])
 
-        # Only show dropdown if last word looks like a path
         if not (last_word.startswith(("./", "/", "~", "../")) or "/" in last_word) and not self.dropdown.isVisible():
-            self.dropdown.clear()
             self.dropdown.hide()
             return
 
-        matches = glob.glob(os.path.join(self.cwd, text.split()[-1] + "*"))
-        if matches:
-            names = [m.split("/")[-1] for m in matches]
-            if len(matches) == 1 and names[0] == text.split()[-1]:
-                self.dropdown.hide()
-                return
+        # Fix: resolve path correctly without os.path.join breaking on spaces
+        if os.path.isabs(last_word) or last_word.startswith("~"):
+            search_base = os.path.expanduser(last_word)
+        else:
+            search_base = os.path.join(self.cwd, last_word)
 
-            self.dropdown.addItems(names)
-            item_height = 19
-            dropdown_h = min(len(names), 6) * item_height
-            self.dropdown.setFixedHeight(dropdown_h)
-            self.dropdown.setFixedWidth(self.input.width())
-            input_rect = self.input.geometry()
-            self.dropdown.move(input_rect.x(), input_rect.y() - dropdown_h - 1)
-            self.dropdown.raise_()
-            self.dropdown.show()
+        # Escape spaces so glob doesn't treat them as separators
+        escaped = glob.escape(search_base.rstrip("*"))
+        pattern = escaped + "*"
+        matches = glob.glob(pattern)
+
+        if not matches:
+            self.dropdown.hide()
+            return
+
+        names = [os.path.basename(m) for m in matches]
+        last_component = last_word.split("/")[-1]
+
+        # Hide if single exact match — nothing left to complete
+        if len(matches) == 1 and names[0] == last_component:
+            self.dropdown.hide()
+            return
+
+        self.dropdown.addItems(names)
+        item_height = 19
+        dropdown_h = min(len(names), 6) * item_height
+        self.dropdown.setFixedHeight(dropdown_h)
+        self.dropdown.setFixedWidth(self.input.width())
+        input_rect = self.input.geometry()
+        self.dropdown.move(input_rect.x(), input_rect.y() - dropdown_h - 1)
+        self.dropdown.raise_()
+        self.dropdown.show()
 
     def select_completion(self):
         item = self.dropdown.currentItem()
