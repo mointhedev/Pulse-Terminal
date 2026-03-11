@@ -208,6 +208,14 @@ class Terminal(QMainWindow):
             return
 
         if self.thread and self.thread.isRunning():
+            # A local command is running — send input to it
+            text = self.input.text()
+            self.output.setTextColor(QColor(CMD_COLOR))
+            self.output.append(f"> {text}")
+            self.output.setTextColor(QColor("#e0e0e0"))
+            self.thread.send_input(text)
+            self.input.clear()
+            return
             return
 
         # If connected via SSH, handle save prompt or route to remote
@@ -309,6 +317,7 @@ class Terminal(QMainWindow):
         self.thread.finished.connect(self.on_command_finished)
         self.thread.start()
         self.input.clear()
+        self.input.setPlaceholderText("input...")
 
     def handle_ssh_command(self, cmd):
         if cmd == "exit":
@@ -610,6 +619,7 @@ class Terminal(QMainWindow):
 
     def on_command_finished(self):
         self.thread = None
+        self.input.setPlaceholderText(f"{self.cwd} $")
 
     def eventFilter(self, source, event):
         if source == self.input and event.type() == QEvent.Type.KeyPress:
@@ -617,7 +627,7 @@ class Terminal(QMainWindow):
                 if self.ssh_thread and self.ssh_thread.is_connected():
                     self.ssh_thread.send_interrupt()
                     return True
-                if self.thread and self.thread.process:
+                if self.thread and self.thread.isRunning():
                     self.thread.kill()
                     self.output.append("^C")
                     return True
