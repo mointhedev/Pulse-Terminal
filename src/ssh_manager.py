@@ -146,9 +146,16 @@ class SSHThread(QThread):
         self._running = False
         self._connected = False
         if self.channel:
-            self.channel.close()
+            try:
+                self.channel.close()
+            except Exception:
+                pass
         if self.client:
-            self.client.close()
+            try:
+                self.client.close()
+            except Exception:
+                pass
+        self.wait(2000)  # wait up to 2s for thread to finish
 
     def is_connected(self):
         return self._connected

@@ -27,6 +27,10 @@ class Terminal(QMainWindow):
         self._ssh_tab_text = ""
         self._collecting_pwd = False
         self._pwd_result = ""
+        self._ls_mode = False
+        self._ssh_bg = "#080d1f"
+        self._detecting_distro = False
+        self._distro_lines = []
 
         self.setWindowTitle("Pulse")
         self.setMinimumSize(400, 300)
@@ -166,7 +170,7 @@ class Terminal(QMainWindow):
                         self.ssh_thread._paused = False  # resume output
 
             self.output.setTextColor(QColor("#00ff99"))
-            self.output.append(f"> {cmd}")
+            self.output.append(f"\n> {cmd}")
             self.output.setTextColor(QColor("#e0e0e0"))
             self.history.append(cmd)
             self.i = len(self.history)
@@ -175,7 +179,7 @@ class Terminal(QMainWindow):
             return
 
         self.output.setTextColor(QColor("#00ff99"))
-        self.output.append(f"> {cmd}")
+        self.output.append(f"\n> {cmd}")
         self.output.setTextColor(QColor("#e0e0e0"))
         self.history.append(cmd)
         self.i = len(self.history)
@@ -237,6 +241,13 @@ class Terminal(QMainWindow):
             self.output.append("")
             return
 
+        # Intercept ls to use ls -p for dir detection
+        if cmd == "ls" or cmd.startswith("ls "):
+            cmd = cmd.replace("ls", "ls -1p", 1)
+            self._ls_mode = True
+        else:
+            self._ls_mode = False
+
         self.ssh_thread.send_command(cmd)
 
         # After cd, send pwd to update the placeholder
@@ -279,11 +290,119 @@ class Terminal(QMainWindow):
         self.ssh_thread.finished.connect(self.on_ssh_disconnected)
         self.ssh_thread.start()
 
+    def _distro_color(self, distro_id):
+        # Each color = distro's native terminal color, darkened + faint Pulse green tint
+        colors = {
+            "ubuntu":   "#130a10",  # dark purple + green tint
+            "debian":   "#0a0a12",  # dark indigo + green tint
+            "centos":   "#0f0a0a",  # dark red + green tint
+            "rhel":     "#0f0a0a",
+            "fedora":   "#090a10",  # dark navy + green tint
+            "alpine":   "#090f0d",  # dark green tint (closest to Pulse)
+            "arch":     "#090a10",  # dark slate + green tint
+        }
+        return colors.get(distro_id.lower().strip('"'), "#090d0f")  # fallback: near-black green tint
+
+    def _apply_local_bg(self):
+        self._ssh_bg = "#0d0d0d"
+        self.output.setStyleSheet("""
+            QTextEdit {
+                background-color: #0d0d0d;
+                color: #e0e0e0;
+                border: none;
+            }
+            QScrollBar:vertical {
+                background: #0d0d0d;
+                width: 6px;
+                border-radius: 3px;
+            }
+            QScrollBar::handle:vertical {
+                background: #1a3d2e;
+                border-radius: 3px;
+                min-height: 10px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #00ff99;
+            }
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+        """)
+        self.input.setStyleSheet(
+            "QLineEdit { background-color: #0d0d0d; color: #00ff99; border: none; border-top: 1px solid #222; padding: 8px; }"
+        )
+        self.central.setStyleSheet("background-color: #0d0d0d;")
+
+    def _apply_ssh_bg(self, color):
+        self._ssh_bg = color
+        self.output.setStyleSheet(f"""
+            QTextEdit {{
+                background-color: {color};
+                color: #e0e0e0;
+                border: none;
+            }}
+            QScrollBar:vertical {{
+                background: {color};
+                width: 6px;
+                border-radius: 3px;
+            }}
+            QScrollBar::handle:vertical {{
+                background: #1a3d2e;
+                border-radius: 3px;
+                min-height: 10px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background: #00ff99;
+            }}
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {{
+                height: 0px;
+            }}
+        """)
+        self.input.setStyleSheet(
+            f"QLineEdit {{ background-color: {color}; color: #00ff99; border: none; border-top: 1px solid #222; padding: 8px; }}"
+        )
+        self.central.setStyleSheet(f"background-color: {color};")
+
     def on_ssh_connected(self, host, user, from_saved=False):
         self.ssh_info = {"host": host, "user": user}
+        self._ssh_bg = "#0d0d0d"
         self.input.setPlaceholderText(f"{user}@{host} $")
+        # Unpause first so cat /etc/os-release output can flow
+        if self.ssh_thread:
+            self.ssh_thread._paused = False
+        # Detect distro
+        self._detecting_distro = True
+        self._distro_lines = []
+        self.ssh_thread.output_ready.disconnect(self.handle_output)
+        self.ssh_thread.output_ready.connect(self._collect_distro)
+        self.ssh_thread.send_command("cat /etc/os-release 2>/dev/null")
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(1000, lambda: self._finish_distro_detect(host, user, from_saved))
+
+    def _collect_distro(self, text, is_error):
+        if self._detecting_distro:
+            self._distro_lines.append(text)
+
+    def _finish_distro_detect(self, host, user, from_saved):
+        self._detecting_distro = False
+        self.ssh_thread.output_ready.disconnect(self._collect_distro)
+        self.ssh_thread.output_ready.connect(self.handle_output)
+
+        # Parse ID= from os-release
+        distro_id = "unknown"
+        for line in self._distro_lines:
+            for part in line.splitlines():
+                part = part.strip()
+                if part.startswith("ID="):
+                    distro_id = part.split("=", 1)[1].strip().strip('"')
+                    break
+
+        self._apply_ssh_bg(self._distro_color(distro_id))
+
         self.output.setTextColor(QColor("#00ff99"))
-        self.output.append(f"Connected to {user}@{host}")
+        self.output.append(f"Connected to {user}@{host} ({distro_id})")
         self.output.setTextColor(QColor("#e0e0e0"))
 
         if not from_saved:
@@ -292,17 +411,25 @@ class Terminal(QMainWindow):
             self._pending_save = {"host": host, "user": user}
         else:
             self._pending_save = None
-            if self.ssh_thread:
-                self.ssh_thread._paused = False
 
     def on_ssh_disconnected(self):
         if self.ssh_info:
+            self.output.append("")
             self.output.append("Connection closed.")
             self.output.append("")
-        self.ssh_thread = None
+        if self.ssh_thread:
+            self.ssh_thread.disconnect()
+            self.ssh_thread = None
         self.ssh_info = None
         self._pending_save = None
+        self._ls_mode = False
+        self._apply_local_bg()
         self.input.setPlaceholderText(f"{self.cwd} $")
+
+    def _show_connecting(self, host, user):
+        self.output.setTextColor(QColor("#00ff99"))
+        self.output.append(f"\nConnecting to {user}@{host}...")
+        self.output.setTextColor(QColor("#e0e0e0"))
 
     def try_parse_ssh(self, cmd):
         # ssh user@host or ssh user@host -p port
@@ -317,6 +444,7 @@ class Terminal(QMainWindow):
         # Check if it's a saved nickname
         conn = get_connection(target)
         if conn:
+            self._show_connecting(conn["host"], conn["user"])
             self.connect_ssh(conn["host"], conn["user"], conn.get("port", 22),
                            conn.get("key_path"), conn.get("password"), from_saved=True)
             return True
@@ -328,6 +456,7 @@ class Terminal(QMainWindow):
             for i, p in enumerate(parts):
                 if p == "-p" and i + 1 < len(parts):
                     port = int(parts[i + 1])
+            self._show_connecting(host, user)
             self.connect_ssh(host, user, port)
             return True
 
@@ -338,12 +467,49 @@ class Terminal(QMainWindow):
             self.output.setTextColor(QColor("#ff4444"))
             self.output.append(text)
             self.output.setTextColor(QColor("#e0e0e0"))
+        elif self._ls_mode and self.ssh_info:
+            self._append_ls_line(text)
         else:
             self.output.append(text)
+        self.output.verticalScrollBar().setValue(
+            self.output.verticalScrollBar().maximum()
+        )
+
+    def _append_ls_line(self, text):
+        cursor = self.output.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        raw = text.strip()
+        if not raw:
+            return
+        # Linux ls wraps names with spaces like: 'Another folder'/
+        # Strip leading/trailing quote chars, then check/strip trailing slash
+        item = raw
+        if (item.startswith("'") and "'" in item[1:]):
+            item = item[1:item.rindex("'")]  # extract between first and last single quote
+        elif item.startswith('"') and '"' in item[1:]:
+            item = item[1:item.rindex('"')]
+        is_dir = raw.endswith("/") or raw.endswith("/'") or raw.endswith('/\"')
+        item = item.rstrip("/")
+        if not item:
+            return
+        display = item + "/" if is_dir else item
+        fmt = self.output.currentCharFormat()
+        cursor.insertText("\n")
+        if is_dir:
+            fmt.setForeground(QColor("#e0e0e0"))
+            fmt.setFontWeight(700)
+        else:
+            fmt.setForeground(QColor("#e0e0e0"))
+            fmt.setFontWeight(400)
+        cursor.setCharFormat(fmt)
+        cursor.insertText(display)
+        # Reset weight so it doesn't bleed into next output
+        fmt.setFontWeight(400)
+        fmt.setForeground(QColor("#e0e0e0"))
+        cursor.setCharFormat(fmt)
+        self.output.setTextCursor(cursor)
 
     def on_command_finished(self):
-        self.output.append("")
-
         self.thread = None
 
     def eventFilter(self, source, event):
@@ -477,7 +643,7 @@ class Terminal(QMainWindow):
         # Temporarily intercept output
         self.ssh_thread.output_ready.disconnect(self.handle_output)
         self.ssh_thread.output_ready.connect(self._collect_ssh_tab)
-        self.ssh_thread.send_command(f"ls {ls_path} 2>/dev/null")
+        self.ssh_thread.send_command(f"ls -1 {ls_path} 2>/dev/null")
 
         # After short delay, process results
         from PySide6.QtCore import QTimer
@@ -485,7 +651,19 @@ class Terminal(QMainWindow):
 
     def _collect_ssh_tab(self, text, is_error):
         if self._collecting_tab and text.strip():
-            self._ssh_tab_results.extend(text.split())
+            for line in text.splitlines():
+                raw = line.strip()
+                if not raw:
+                    continue
+                # Strip Linux ls quoting: 'name with spaces'
+                if raw.startswith("'") and "'" in raw[1:]:
+                    item = raw[1:raw.rindex("'")]
+                elif raw.startswith('"') and '"' in raw[1:]:
+                    item = raw[1:raw.rindex('"')]
+                else:
+                    item = raw.rstrip("/")
+                if item:
+                    self._ssh_tab_results.append(item)
 
     def _finish_ssh_tab(self):
         self._collecting_tab = False
@@ -505,10 +683,12 @@ class Terminal(QMainWindow):
             return
 
         if len(names) == 1:
-            # Auto complete
-            parts = self._ssh_tab_text.split(maxsplit=1)
             parts_list = self._ssh_tab_text.split()
-            parts_list[-1] = prefix + names[0]
+            completed = prefix + names[0]
+            # Quote if spaces in name
+            if " " in completed:
+                completed = f'"{completed}"'
+            parts_list[-1] = completed
             self.input.setText(" ".join(parts_list))
             return
 
@@ -576,12 +756,12 @@ class Terminal(QMainWindow):
         text = self.input.text()
         parts = text.split()
         last_word = parts[-1]
-        # Replace only the last path component
         parent = "/".join(last_word.split("/")[:-1])
-        if parent:
-            parts[-1] = parent + "/" + item.text()
-        else:
-            parts[-1] = item.text()
+        completed = (parent + "/" + item.text()) if parent else item.text()
+        # Quote if spaces in name
+        if " " in completed:
+            completed = f'"{completed}"'
+        parts[-1] = completed
         self.input.setText(" ".join(parts))
         self.dropdown.hide()
 
