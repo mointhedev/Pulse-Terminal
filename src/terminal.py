@@ -2,14 +2,74 @@
 import subprocess
 import os
 
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QMainWindow, QTextEdit, QLineEdit, QListWidget
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QMainWindow, QTextEdit, QLineEdit, QListWidget, QDialog, QLabel, QPushButton, QHBoxLayout, QLineEdit as QLE
 from PySide6.QtGui import QFont, QColor, QTextCharFormat, QKeyEvent
 from PySide6.QtCore import Qt, QEvent
 import glob
 
 from pulse_overlay import PulseOverlay
 from command_thread import CommandThread
-from ssh_manager import SSHThread, get_connection, save_connection
+from ssh_manager import SSHThread, UploadThread, DownloadThread, get_connection, save_connection
+
+CMD_COLOR    = "#00ff99"  # input commands > ls
+STATUS_COLOR = "#5fba8a"  # info/status messages
+SUCCESS_COLOR = "#00ff99" # ✓ success
+ERROR_COLOR  = "#ff4444"  # errors
+
+
+class ConflictDialog(QDialog):
+    def __init__(self, filename, parent=None):
+        super().__init__(parent)
+        self.action = None
+        self.new_name = None
+        self.setWindowTitle("File Conflict")
+        self.setStyleSheet("background-color: #1a1a1a; color: #e0e0e0; font-family: Menlo; font-size: 13px;")
+        self.setMinimumWidth(400)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        self._label = QLabel(f'"{filename}" already exists on the server.\nWhat would you like to do?')
+        layout.addWidget(self._label)
+
+        self._name_input = QLE(filename)
+        self._name_input.setStyleSheet("background-color: #0d0d0d; color: #00ff99; border: 1px solid #333; padding: 4px;")
+        self._name_input.hide()
+        self._name_input.returnPressed.connect(self._confirm_rename)
+        layout.addWidget(self._name_input)
+
+        btn_row = QHBoxLayout()
+        self._rename_btn = QPushButton("Rename")
+        for btn, action in [(QPushButton("Overwrite"), "overwrite"), (self._rename_btn, "rename"), (QPushButton("Skip"), "skip")]:
+            btn.setStyleSheet("QPushButton { background-color: #1a3d2e; color: #00ff99; border: none; padding: 6px 14px; } QPushButton:hover { background-color: #00ff99; color: #0d0d0d; }")
+            btn_row.addWidget(btn)
+        layout.addLayout(btn_row)
+
+        # Wire buttons individually
+        layout.itemAt(2).layout().itemAt(0).widget().clicked.connect(lambda: self._on_action("overwrite"))
+        self._rename_btn.clicked.connect(self._toggle_rename)
+        layout.itemAt(2).layout().itemAt(2).widget().clicked.connect(lambda: self._on_action("skip"))
+
+    def _toggle_rename(self):
+        if self._name_input.isHidden():
+            self._name_input.show()
+            self._name_input.setFocus()
+            self._name_input.selectAll()
+            self._rename_btn.setText("Confirm Rename")
+        else:
+            self._confirm_rename()
+
+    def _confirm_rename(self):
+        new_name = self._name_input.text().strip()
+        if not new_name:
+            return
+        self.action = "rename"
+        self.new_name = new_name
+        self.accept()
+
+    def _on_action(self, action):
+        self.action = action
+        self.accept()
+
 
 class Terminal(QMainWindow):
     def __init__(self):
@@ -34,6 +94,7 @@ class Terminal(QMainWindow):
 
         self.setWindowTitle("Pulse")
         self.setMinimumSize(400, 300)
+        self.setAcceptDrops(True)
         self.setStyleSheet("background-color: #0d0d0d;")
 
 
@@ -156,7 +217,7 @@ class Terminal(QMainWindow):
                     nickname = cmd.split(maxsplit=1)[1].strip()
                     save_connection(nickname, self._pending_save["host"], self._pending_save["user"])
                     self._pending_save = None
-                    self.output.setTextColor(QColor("#00ff99"))
+                    self.output.setTextColor(QColor(STATUS_COLOR))
                     self.output.append(f"Saved as '{nickname}'")
                     self.output.setTextColor(QColor("#e0e0e0"))
                     self.output.append("")
@@ -183,6 +244,24 @@ class Terminal(QMainWindow):
         self.output.setTextColor(QColor("#e0e0e0"))
         self.history.append(cmd)
         self.i = len(self.history)
+        # Handle ssh-list
+        if cmd == "ssh-list":
+            from ssh_manager import load_connections
+            connections = load_connections()
+            if not connections:
+                self.output.append("No saved connections.")
+            else:
+                self.output.setTextColor(QColor(STATUS_COLOR))
+                self.output.append("Saved connections:")
+                self.output.setTextColor(QColor("#e0e0e0"))
+                for nickname, info in connections.items():
+                    port = info.get("port", 22)
+                    port_str = f":{port}" if port != 22 else ""
+                    self.output.append(f"  {nickname}  →  {info['user']}@{info['host']}{port_str}")
+            self.output.append("")
+            self.input.clear()
+            return
+
         # Handle ssh-delete
         if cmd.startswith("ssh-delete "):
             nickname = cmd.split(maxsplit=1)[1].strip()
@@ -241,6 +320,23 @@ class Terminal(QMainWindow):
             self.output.append("")
             return
 
+        if cmd == "upload":
+            self._open_file_picker()
+            return
+
+        if cmd == "upload-dir":
+            self._open_dir_picker()
+            return
+
+        if cmd.startswith("download "):
+            target = cmd.split(maxsplit=1)[1].strip().strip('"\'')
+            # Build full remote path
+            if not target.startswith("/"):
+                remote_cwd = getattr(self, '_remote_cwd', '/root')
+                target = remote_cwd.rstrip("/") + "/" + target
+            self._start_download(target)
+            return
+
         # Intercept ls to use ls -p for dir detection
         if cmd == "ls" or cmd.startswith("ls "):
             cmd = cmd.replace("ls", "ls -1p", 1)
@@ -275,6 +371,7 @@ class Terminal(QMainWindow):
         self.ssh_thread.output_ready.disconnect(self._collect_pwd)
         self.ssh_thread.output_ready.connect(self.handle_output)
         if self._pwd_result:
+            self._remote_cwd = self._pwd_result  # track for file uploads
             user = self.ssh_info["user"]
             host = self.ssh_info["host"]
             # Trim to user/lastfolder or root/lastfolder
@@ -368,6 +465,7 @@ class Terminal(QMainWindow):
     def on_ssh_connected(self, host, user, from_saved=False):
         self.ssh_info = {"host": host, "user": user}
         self._ssh_bg = "#0d0d0d"
+        self._remote_cwd = f"/home/{user}" if user != "root" else "/root"
         self.input.setPlaceholderText(f"{user}@{host} $")
         # Unpause first so cat /etc/os-release output can flow
         if self.ssh_thread:
@@ -401,7 +499,7 @@ class Terminal(QMainWindow):
 
         self._apply_ssh_bg(self._distro_color(distro_id))
 
-        self.output.setTextColor(QColor("#00ff99"))
+        self.output.setTextColor(QColor(SUCCESS_COLOR))
         self.output.append(f"Connected to {user}@{host} ({distro_id})")
         self.output.setTextColor(QColor("#e0e0e0"))
 
@@ -423,11 +521,12 @@ class Terminal(QMainWindow):
         self.ssh_info = None
         self._pending_save = None
         self._ls_mode = False
+        self._remote_cwd = None
         self._apply_local_bg()
         self.input.setPlaceholderText(f"{self.cwd} $")
 
     def _show_connecting(self, host, user):
-        self.output.setTextColor(QColor("#00ff99"))
+        self.output.setTextColor(QColor(STATUS_COLOR))
         self.output.append(f"\nConnecting to {user}@{host}...")
         self.output.setTextColor(QColor("#e0e0e0"))
 
@@ -768,6 +867,157 @@ class Terminal(QMainWindow):
     def _do_clear(self):
         self.output.clear()
         self.output.setTextColor(QColor("#e0e0e0"))
+
+    def dragEnterEvent(self, event):
+        if self.ssh_info and self.ssh_thread and event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        if not self.ssh_info or not self.ssh_thread:
+            return
+        urls = event.mimeData().urls()
+        for url in urls:
+            local_path = url.toLocalFile()
+            if not local_path:
+                continue
+            remote_dir = getattr(self, '_remote_cwd', '~')
+            self._start_upload(local_path, remote_dir)
+
+    def _open_file_picker(self):
+        from PySide6.QtWidgets import QFileDialog
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select Files to Upload", os.path.expanduser("~"), "All Files (*)"
+        )
+        if not paths:
+            return
+        remote_dir = getattr(self, '_remote_cwd', '/root')
+        for path in paths:
+            self._start_upload(path, remote_dir)
+
+    def _open_dir_picker(self):
+        from PySide6.QtWidgets import QFileDialog
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Folder to Upload", os.path.expanduser("~")
+        )
+        if not folder:
+            return
+        remote_dir = getattr(self, '_remote_cwd', '/root')
+        self._start_upload(folder, remote_dir)
+
+    def _start_upload(self, local_path, remote_dir):
+        name = os.path.basename(local_path)
+        kind = "folder" if os.path.isdir(local_path) else "file"
+        self._upload_local_name = name
+        self._upload_kind = kind
+        self._upload_remote_dir = remote_dir
+        self.output.setTextColor(QColor(STATUS_COLOR))
+        self.output.append(f"\nPreparing to upload {kind} '{name}'...")
+        self.output.append("Uploading... 0%")
+        self.output.setTextColor(QColor("#e0e0e0"))
+
+        self._upload_thread = UploadThread(self.ssh_thread, local_path, remote_dir)
+        self._upload_thread.progress.connect(self._update_upload_progress)
+        self._upload_thread.done.connect(self._on_upload_done)
+        self._upload_thread.error.connect(self._on_upload_error)
+        self._upload_thread.conflict.connect(self._on_upload_conflict)
+        self._upload_thread.start()
+
+    def _update_upload_progress(self, msg):
+        # Replace the last line in output with the updated progress
+        cursor = self.output.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        cursor.select(cursor.SelectionType.LineUnderCursor)
+        cursor.insertText(msg)
+        self.output.setTextCursor(cursor)
+        self.output.verticalScrollBar().setValue(self.output.verticalScrollBar().maximum())
+
+    def _on_upload_conflict(self, filename):
+        dialog = ConflictDialog(filename, self)
+        dialog.exec()
+        action = dialog.action or "skip"
+        self._upload_thread.resolve(action, dialog.new_name)
+
+    def _on_upload_done(self, final_name):
+        if not final_name:
+            self.output.setTextColor(QColor("#e0e0e0"))
+            self.output.append("Upload skipped")
+            self.output.setTextColor(QColor("#e0e0e0"))
+        else:
+            # Replace the progress line with success
+            cursor = self.output.textCursor()
+            cursor.movePosition(cursor.MoveOperation.End)
+            cursor.select(cursor.SelectionType.LineUnderCursor)
+            fmt = self.output.currentCharFormat()
+            fmt.setForeground(QColor(SUCCESS_COLOR))
+            cursor.setCharFormat(fmt)
+            cursor.insertText(f"✓ '{final_name}' uploaded successfully")
+            fmt.setForeground(QColor("#e0e0e0"))
+            cursor.setCharFormat(fmt)
+            self.output.setTextCursor(cursor)
+        self.output.verticalScrollBar().setValue(self.output.verticalScrollBar().maximum())
+        self.output.append("")
+
+    def _on_upload_error(self, err):
+        self.output.setTextColor(QColor("#ff4444"))
+        self.output.append(f"Upload failed: {err}")
+        self.output.setTextColor(QColor("#e0e0e0"))
+        self.output.append("")
+
+    def _start_download(self, remote_path):
+        name = remote_path.rstrip("/").split("/")[-1]
+        local_dir = os.path.expanduser("~/Downloads")
+        self.output.setTextColor(QColor(STATUS_COLOR))
+        self.output.append(f"\nDownloading '{name}' → {local_dir}")
+        self.output.append("Downloading... 0%")
+        self.output.setTextColor(QColor("#e0e0e0"))
+
+        self._download_thread = DownloadThread(self.ssh_thread, remote_path, local_dir)
+        self._download_thread.progress.connect(self._update_download_progress)
+        self._download_thread.done.connect(self._on_download_done)
+        self._download_thread.error.connect(self._on_download_error)
+        self._download_thread.conflict.connect(self._on_download_conflict)
+        self._download_thread.start()
+
+    def _update_download_progress(self, msg):
+        cursor = self.output.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        cursor.select(cursor.SelectionType.LineUnderCursor)
+        cursor.insertText(msg)
+        self.output.setTextCursor(cursor)
+        self.output.verticalScrollBar().setValue(self.output.verticalScrollBar().maximum())
+
+    def _on_download_conflict(self, filename):
+        dialog = ConflictDialog(filename, self)
+        dialog.exec()
+        action = dialog.action or "skip"
+        self._download_thread.resolve(action, dialog.new_name)
+
+    def _on_download_done(self, final_name):
+        if not final_name:
+            self.output.setTextColor(QColor("#e0e0e0"))
+            self.output.append("Download skipped")
+            self.output.setTextColor(QColor("#e0e0e0"))
+        else:
+            cursor = self.output.textCursor()
+            cursor.movePosition(cursor.MoveOperation.End)
+            cursor.select(cursor.SelectionType.LineUnderCursor)
+            fmt = self.output.currentCharFormat()
+            fmt.setForeground(QColor(SUCCESS_COLOR))
+            cursor.setCharFormat(fmt)
+            cursor.insertText(f"✓ '{final_name}' downloaded to ~/Downloads")
+            fmt.setForeground(QColor("#e0e0e0"))
+            cursor.setCharFormat(fmt)
+            self.output.setTextCursor(cursor)
+        self.output.verticalScrollBar().setValue(self.output.verticalScrollBar().maximum())
+        self.output.append("")
+
+    def _on_download_error(self, err):
+        self.output.setTextColor(QColor("#ff4444"))
+        self.output.append(f"Download failed: {err}")
+        self.output.setTextColor(QColor("#e0e0e0"))
+        self.output.append("")
 
 
 
