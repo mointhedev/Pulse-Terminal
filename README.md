@@ -12,7 +12,7 @@ A modern, minimal, dark GUI terminal built from scratch in Python using PySide6.
 
 ## Tech Stack
 - Python 3
-- PySide6 (Qt6)
+- PySide6 
 
 ## Getting Started
 

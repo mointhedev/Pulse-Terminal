@@ -11,3 +11,25 @@ if __name__ == "__main__":
     window = Terminal()        # 2. Create a window
     window.show()                  # 3. Show it
     sys.exit(app.exec())           # 4. Start the event loop
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

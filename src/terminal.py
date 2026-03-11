@@ -9,6 +9,7 @@ import glob
 
 from pulse_overlay import PulseOverlay
 from command_thread import CommandThread
+from ssh_manager import SSHThread, get_connection, save_connection
 
 class Terminal(QMainWindow):
     def __init__(self):
@@ -17,6 +18,15 @@ class Terminal(QMainWindow):
         self.history = []
         self.i = 0
         self.thread = None
+        self.ssh_thread = None
+        self.ssh_info = None
+        self._pending_save = None
+        self._collecting_tab = False
+        self._ssh_tab_results = []
+        self._ssh_tab_partial = ""
+        self._ssh_tab_text = ""
+        self._collecting_pwd = False
+        self._pwd_result = ""
 
         self.setWindowTitle("Pulse")
         self.setMinimumSize(400, 300)
@@ -126,9 +136,42 @@ class Terminal(QMainWindow):
         cmd = self.input.text().strip()
 
         if not cmd:
+            # If pending save and user pressed enter to skip
+            if self.ssh_info and hasattr(self, '_pending_save') and self._pending_save:
+                self._pending_save = None
+                self.input.clear()
             return
 
         if self.thread and self.thread.isRunning():
+            return
+
+        # If connected via SSH, handle save prompt or route to remote
+        if self.ssh_info:
+            if hasattr(self, '_pending_save') and self._pending_save:
+                if cmd.startswith("save "):
+                    nickname = cmd.split(maxsplit=1)[1].strip()
+                    save_connection(nickname, self._pending_save["host"], self._pending_save["user"])
+                    self._pending_save = None
+                    self.output.setTextColor(QColor("#00ff99"))
+                    self.output.append(f"Saved as '{nickname}'")
+                    self.output.setTextColor(QColor("#e0e0e0"))
+                    self.output.append("")
+                    self.input.clear()
+                    if self.ssh_thread:
+                        self.ssh_thread._paused = False  # resume output
+                    return
+                else:
+                    self._pending_save = None
+                    if self.ssh_thread:
+                        self.ssh_thread._paused = False  # resume output
+
+            self.output.setTextColor(QColor("#00ff99"))
+            self.output.append(f"> {cmd}")
+            self.output.setTextColor(QColor("#e0e0e0"))
+            self.history.append(cmd)
+            self.i = len(self.history)
+            self.input.clear()
+            self.handle_ssh_command(cmd)
             return
 
         self.output.setTextColor(QColor("#00ff99"))
@@ -136,6 +179,23 @@ class Terminal(QMainWindow):
         self.output.setTextColor(QColor("#e0e0e0"))
         self.history.append(cmd)
         self.i = len(self.history)
+        # Handle ssh-delete
+        if cmd.startswith("ssh-delete "):
+            nickname = cmd.split(maxsplit=1)[1].strip()
+            from ssh_manager import delete_connection
+            delete_connection(nickname)
+            self.output.append(f"Deleted connection '{nickname}'")
+            self.output.append("")
+            self.input.clear()
+            return
+
+        # Handle ssh
+        if cmd.startswith("ssh ") or cmd == "ssh":
+            self.input.clear()
+            if not self.try_parse_ssh(cmd):
+                self.handle_output("Usage: ssh user@host [-p port] or ssh <nickname>", True)
+            return
+
         # Handle cd separately
         if cmd.startswith("cd"):
             parts = cmd.split(maxsplit=1)
@@ -165,7 +225,113 @@ class Terminal(QMainWindow):
         self.thread.output_ready.connect(self.handle_output)
         self.thread.finished.connect(self.on_command_finished)
         self.thread.start()
-        self.input.clear()  # ← add this
+        self.input.clear()
+
+    def handle_ssh_command(self, cmd):
+        if cmd == "exit":
+            self.ssh_thread.disconnect()
+            self.ssh_thread = None
+            self.ssh_info = None
+            self.input.setPlaceholderText(f"{self.cwd} $")
+            self.output.append("Disconnected.")
+            self.output.append("")
+            return
+
+        self.ssh_thread.send_command(cmd)
+
+        # After cd, send pwd to update the placeholder
+        if cmd.startswith("cd"):
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(500, self._update_ssh_prompt)
+
+    def _update_ssh_prompt(self):
+        if not self.ssh_thread or not self.ssh_info:
+            return
+        self._collecting_pwd = True
+        self._pwd_result = ""
+        self.ssh_thread.output_ready.disconnect(self.handle_output)
+        self.ssh_thread.output_ready.connect(self._collect_pwd)
+        self.ssh_thread.send_command("pwd")
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(500, self._finish_pwd)
+
+    def _collect_pwd(self, text, is_error):
+        if self._collecting_pwd and text.strip().startswith("/"):
+            self._pwd_result = text.strip()
+
+    def _finish_pwd(self):
+        self._collecting_pwd = False
+        self.ssh_thread.output_ready.disconnect(self._collect_pwd)
+        self.ssh_thread.output_ready.connect(self.handle_output)
+        if self._pwd_result:
+            user = self.ssh_info["user"]
+            host = self.ssh_info["host"]
+            # Trim to user/lastfolder or root/lastfolder
+            parts = self._pwd_result.split("/")
+            short_path = "/".join(parts[-2:]) if len(parts) > 2 else self._pwd_result
+            self.input.setPlaceholderText(f"{short_path} $")
+
+    def connect_ssh(self, host, user, port=22, key_path=None, password=None, from_saved=False):
+        self.ssh_thread = SSHThread(host, user, port, key_path, password)
+        self.ssh_thread.output_ready.connect(self.handle_output)
+        self.ssh_thread.error.connect(lambda e: self.handle_output(f"SSH error: {e}", True))
+        self.ssh_thread.connected.connect(lambda fs=from_saved: self.on_ssh_connected(host, user, fs))
+        self.ssh_thread.finished.connect(self.on_ssh_disconnected)
+        self.ssh_thread.start()
+
+    def on_ssh_connected(self, host, user, from_saved=False):
+        self.ssh_info = {"host": host, "user": user}
+        self.input.setPlaceholderText(f"{user}@{host} $")
+        self.output.setTextColor(QColor("#00ff99"))
+        self.output.append(f"Connected to {user}@{host}")
+        self.output.setTextColor(QColor("#e0e0e0"))
+
+        if not from_saved:
+            self.output.append("Save this connection? Type 'save <nickname>' or press Enter to skip.")
+            self.output.append("")
+            self._pending_save = {"host": host, "user": user}
+        else:
+            self._pending_save = None
+            if self.ssh_thread:
+                self.ssh_thread._paused = False
+
+    def on_ssh_disconnected(self):
+        if self.ssh_info:
+            self.output.append("Connection closed.")
+            self.output.append("")
+        self.ssh_thread = None
+        self.ssh_info = None
+        self._pending_save = None
+        self.input.setPlaceholderText(f"{self.cwd} $")
+
+    def try_parse_ssh(self, cmd):
+        # ssh user@host or ssh user@host -p port
+        parts = cmd.split()
+        if parts[0] != "ssh":
+            return False
+
+        target = parts[1] if len(parts) > 1 else None
+        if not target:
+            return False
+
+        # Check if it's a saved nickname
+        conn = get_connection(target)
+        if conn:
+            self.connect_ssh(conn["host"], conn["user"], conn.get("port", 22),
+                           conn.get("key_path"), conn.get("password"), from_saved=True)
+            return True
+
+        # Parse user@host
+        if "@" in target:
+            user, host = target.split("@", 1)
+            port = 22
+            for i, p in enumerate(parts):
+                if p == "-p" and i + 1 < len(parts):
+                    port = int(parts[i + 1])
+            self.connect_ssh(host, user, port)
+            return True
+
+        return False
 
     def handle_output(self, text, is_error):
         if is_error:
@@ -183,6 +349,9 @@ class Terminal(QMainWindow):
     def eventFilter(self, source, event):
         if source == self.input and event.type() == QEvent.Type.KeyPress:
             if event.key() == Qt.Key.Key_C and (event.modifiers() & Qt.KeyboardModifier.MetaModifier or event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+                if self.ssh_thread and self.ssh_thread.is_connected():
+                    self.ssh_thread.send_interrupt()
+                    return True
                 if self.thread and self.thread.process:
                     self.thread.kill()
                     self.output.append("^C")
@@ -213,12 +382,27 @@ class Terminal(QMainWindow):
                 if self.dropdown.isVisible() and self.dropdown.currentRow() >= 0:
                     self.select_completion()
                     return True
-                return False  # let returnPressed signal fire normally → run_command
+                # Handle empty enter to skip pending save
+                if not self.input.text().strip() and self.ssh_info and hasattr(self,
+                                                                               '_pending_save') and self._pending_save:
+                    self._pending_save = None
+                    if self.ssh_thread:
+                        self.ssh_thread._paused = False
+                    self.output.append("Skipped.")
+                    self.output.append("")
+                    return True
+                return False
 
             elif event.key() == Qt.Key.Key_Tab:
                 if self.dropdown.isVisible() and self.dropdown.currentRow() >= 0:
                     self.select_completion()
                     return True
+
+                # SSH tab completion
+                if self.ssh_info and self.ssh_thread:
+                    self.ssh_complete_tab()
+                    return True
+
                 text = self.input.text()
                 self.dropdown.clear()
                 self.dropdown.hide()
@@ -256,8 +440,89 @@ class Terminal(QMainWindow):
                     return True
         return super().eventFilter(source, event)
 
-    def update_dropdown(self, text):
+    def show_dropdown(self, names):
         self.dropdown.clear()
+        self.dropdown.addItems(names)
+        item_height = 19
+        dropdown_h = min(len(names), 6) * item_height
+        self.dropdown.setFixedHeight(dropdown_h)
+        self.dropdown.setFixedWidth(self.input.width())
+        input_rect = self.input.geometry()
+        self.dropdown.move(input_rect.x(), input_rect.y() - dropdown_h - 1)
+        self.dropdown.raise_()
+        self.dropdown.show()
+
+    def ssh_complete_tab(self):
+        text = self.input.text()
+        if not text.strip():
+            return
+
+        parts = text.split(maxsplit=1)
+        last_word = parts[1] if len(parts) > 1 else ""
+
+        # Build ls command for the partial path
+        if last_word.endswith("/"):
+            ls_path = last_word
+        elif "/" in last_word:
+            ls_path = "/".join(last_word.split("/")[:-1]) + "/"
+        else:
+            ls_path = "./"
+
+        # Run ls on remote and collect results
+        self._ssh_tab_partial = last_word
+        self._ssh_tab_text = text
+        self._ssh_tab_results = []
+        self._collecting_tab = True
+
+        # Temporarily intercept output
+        self.ssh_thread.output_ready.disconnect(self.handle_output)
+        self.ssh_thread.output_ready.connect(self._collect_ssh_tab)
+        self.ssh_thread.send_command(f"ls {ls_path} 2>/dev/null")
+
+        # After short delay, process results
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(800, self._finish_ssh_tab)
+
+    def _collect_ssh_tab(self, text, is_error):
+        if self._collecting_tab and text.strip():
+            self._ssh_tab_results.extend(text.split())
+
+    def _finish_ssh_tab(self):
+        self._collecting_tab = False
+        self.ssh_thread.output_ready.disconnect(self._collect_ssh_tab)
+        self.ssh_thread.output_ready.connect(self.handle_output)
+
+        last_word = self._ssh_tab_partial
+        last_component = last_word.split("/")[-1]
+        prefix = "/".join(last_word.split("/")[:-1])
+        if prefix:
+            prefix += "/"
+
+        # Filter by what user has typed so far
+        names = [n for n in self._ssh_tab_results if n.startswith(last_component)]
+
+        if not names:
+            return
+
+        if len(names) == 1:
+            # Auto complete
+            parts = self._ssh_tab_text.split(maxsplit=1)
+            parts_list = self._ssh_tab_text.split()
+            parts_list[-1] = prefix + names[0]
+            self.input.setText(" ".join(parts_list))
+            return
+
+        self.show_dropdown(names)
+
+    def update_dropdown(self, text):
+
+        if self.ssh_info:
+            self.dropdown.hide()
+            return
+
+        
+        self.dropdown.clear()
+
 
         if not text.strip() or len(text.split()) < 2:
             self.dropdown.hide()
