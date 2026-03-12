@@ -72,7 +72,7 @@ class ConflictDialog(QDialog):
 
 
 class Terminal(QMainWindow):
-    def __init__(self):
+    def __init__(self, screen_session=None, ssh_info=None):
         super().__init__()
         self.cwd = os.path.expanduser("~")
         self.history = []
@@ -91,8 +91,14 @@ class Terminal(QMainWindow):
         self._ssh_bg = "#080d1f"
         self._detecting_distro = False
         self._distro_lines = []
+        self._password_mode = False
+        self._screen_session = screen_session  # name of screen session if this is a screen window
+        self._spawn_ssh_info = ssh_info        # ssh credentials to auto-connect with
 
-        self.setWindowTitle("Pulse")
+        if screen_session:
+            self.setWindowTitle(f"screen: {screen_session}")
+        else:
+            self.setWindowTitle("Pulse")
         self.setMinimumSize(400, 300)
         self.setAcceptDrops(True)
         self.setStyleSheet("background-color: #0d0d0d;")
@@ -174,8 +180,9 @@ class Terminal(QMainWindow):
         bold_format.setForeground(QColor("#00ff99"))
 
         cursor = self.output.textCursor()
-        cursor.setCharFormat(bold_format)
-        cursor.insertText("Pulse Terminal v0.1 ⚡\n")
+        if not screen_session:
+            cursor.setCharFormat(bold_format)
+            cursor.insertText("Pulse Terminal v0.1 ⚡\n")
         self.output.setTextCursor(cursor)
 
         default_format = QTextCharFormat()
@@ -197,6 +204,11 @@ class Terminal(QMainWindow):
 
         layout.addWidget(self.input)
 
+        # Auto-connect and run screen command if spawned as a screen window
+        if self._spawn_ssh_info and self._screen_session:
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(300, self._auto_connect_screen)
+
     def run_command(self):
         cmd = self.input.text().strip()
 
@@ -208,11 +220,19 @@ class Terminal(QMainWindow):
             return
 
         if self.thread and self.thread.isRunning():
-            # A local command is running — send input to it
             text = self.input.text()
-            self.output.setTextColor(QColor(CMD_COLOR))
-            self.output.append(f"> {text}")
-            self.output.setTextColor(QColor("#e0e0e0"))
+            if not self._password_mode:
+                self.output.setTextColor(QColor(CMD_COLOR))
+                self.output.append(f"> {text}")
+                self.output.setTextColor(QColor("#e0e0e0"))
+            else:
+                # Show masked password as *** 
+                self.output.setTextColor(QColor(STATUS_COLOR))
+                self.output.append(f"> {'*' * len(text)}")
+                self.output.setTextColor(QColor("#e0e0e0"))
+                self._password_mode = False
+                self.input.setEchoMode(QLineEdit.EchoMode.Normal)
+                self.input.setPlaceholderText("input...")
             self.thread.send_input(text)
             self.input.clear()
             return
@@ -314,6 +334,7 @@ class Terminal(QMainWindow):
 
         self.thread = CommandThread(cmd, self.cwd)
         self.thread.output_ready.connect(self.handle_output)
+        self.thread.password_prompt.connect(self._on_password_prompt)
         self.thread.finished.connect(self.on_command_finished)
         self.thread.start()
         self.input.clear()
@@ -327,6 +348,11 @@ class Terminal(QMainWindow):
             self.input.setPlaceholderText(f"{self.cwd} $")
             self.output.append("Disconnected.")
             self.output.append("")
+            return
+
+        # Handle screen commands
+        if cmd.startswith("screen"):
+            self._handle_screen_command(cmd)
             return
 
         if cmd == "upload":
@@ -389,12 +415,23 @@ class Terminal(QMainWindow):
             self.input.setPlaceholderText(f"{short_path} $")
 
     def connect_ssh(self, host, user, port=22, key_path=None, password=None, from_saved=False):
-        self.ssh_thread = SSHThread(host, user, port, key_path, password)
+        self.ssh_thread = SSHThread(host, user, port, key_path, password, screen_mode=bool(self._screen_session))
         self.ssh_thread.output_ready.connect(self.handle_output)
         self.ssh_thread.error.connect(lambda e: self.handle_output(f"SSH error: {e}", True))
         self.ssh_thread.connected.connect(lambda fs=from_saved: self.on_ssh_connected(host, user, fs))
         self.ssh_thread.finished.connect(self.on_ssh_disconnected)
         self.ssh_thread.start()
+
+    def _auto_connect_screen(self):
+        """Called after window opens — auto SSH and launch/attach screen session."""
+        info = self._spawn_ssh_info
+        self.connect_ssh(
+            info["host"], info["user"],
+            info.get("port", 22),
+            info.get("key_path"),
+            info.get("password"),
+            from_saved=True
+        )
 
     def _distro_color(self, distro_id):
         # Each color = distro's native terminal color, darkened + faint Pulse green tint
@@ -472,7 +509,7 @@ class Terminal(QMainWindow):
         self.central.setStyleSheet(f"background-color: {color};")
 
     def on_ssh_connected(self, host, user, from_saved=False):
-        self.ssh_info = {"host": host, "user": user}
+        self.ssh_info = {"host": host, "user": user, "port": self.ssh_thread.port if hasattr(self.ssh_thread, 'port') else 22}
         self._ssh_bg = "#0d0d0d"
         self._remote_cwd = f"/home/{user}" if user != "root" else "/root"
         self.input.setPlaceholderText(f"{user}@{host} $")
@@ -509,15 +546,74 @@ class Terminal(QMainWindow):
         self._apply_ssh_bg(self._distro_color(distro_id))
 
         self.output.setTextColor(QColor(SUCCESS_COLOR))
-        self.output.append(f"Connected to {user}@{host} ({distro_id})")
+        if not self._screen_session:
+            self.output.append(f"Connected to {user}@{host} ({distro_id})")
         self.output.setTextColor(QColor("#e0e0e0"))
 
-        if not from_saved:
+        if not from_saved and not self._screen_session:
             self.output.append("Save this connection? Type 'save <nickname>' or press Enter to skip.")
             self.output.append("")
             self._pending_save = {"host": host, "user": user}
         else:
             self._pending_save = None
+
+        # If this window was spawned for a screen session, send the screen command now
+        if hasattr(self, '_screen_cmd_pending') and self._screen_cmd_pending:
+            session = self._screen_cmd_pending
+            self._screen_cmd_pending = None
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(500, lambda: self._send_screen_attach(session))
+
+    def _handle_screen_command(self, cmd):
+        parts = cmd.split(None, 2)
+        # screen list → just run screen -ls in current window
+        if len(parts) == 1 or parts[1] in ("list", "-ls", "ls"):
+            self.ssh_thread.send_command("screen -ls")
+            return
+
+        action = parts[1]   # start | attach | detach | kill
+        name = parts[2].strip() if len(parts) > 2 else "main"
+
+        if action in ("start", "new"):
+            self._spawn_screen_window(name, "start")
+        elif action in ("attach", "resume", "-r"):
+            self._spawn_screen_window(name, "attach")
+        elif action in ("detach", "-d"):
+            self.ssh_thread.send_command(f"screen -d {name}")
+        elif action in ("kill", "quit"):
+            self.ssh_thread.send_command(f"screen -X -S {name} quit")
+        else:
+            # Unknown — pass through as-is
+            self.ssh_thread.send_command(cmd)
+
+    def _spawn_screen_window(self, name, action):
+        """Open a new Pulse window for the given screen session."""
+        from PySide6.QtWidgets import QApplication
+        info = self.ssh_info.copy()
+        session_spec = f"{action} {name}"
+        win = Terminal(screen_session=f"{name}", ssh_info=info)
+        win._screen_cmd_pending = session_spec
+        win.resize(self.size())
+        win.show()
+        # Keep reference so it doesn't get garbage collected
+        if not hasattr(QApplication.instance(), '_pulse_windows'):
+            QApplication.instance()._pulse_windows = []
+        QApplication.instance()._pulse_windows.append(win)
+
+    def _send_screen_attach(self, session_spec):
+        """session_spec is 'start <name>' or 'attach <name>'"""
+        parts = session_spec.split(None, 1)
+        action = parts[0]  # 'start' or 'attach'
+        name = parts[1] if len(parts) > 1 else "main"
+        if action == "start":
+            cmd = f"screen -S {name}"
+        else:
+            cmd = f"screen -d -r {name}"  # force detach existing, then reattach
+        self.output.setTextColor(QColor(CMD_COLOR))
+        if not self._screen_session:
+            self.output.append(f"\n> {cmd}")
+        self.output.setTextColor(QColor("#e0e0e0"))
+        self.ssh_thread.send_command(cmd)
 
     def on_ssh_disconnected(self):
         if self.ssh_info:
@@ -535,6 +631,8 @@ class Terminal(QMainWindow):
         self.input.setPlaceholderText(f"{self.cwd} $")
 
     def _show_connecting(self, host, user):
+        if self._screen_session:
+            return
         self.output.setTextColor(QColor(STATUS_COLOR))
         self.output.append(f"\nConnecting to {user}@{host}...")
         self.output.setTextColor(QColor("#e0e0e0"))
@@ -571,6 +669,9 @@ class Terminal(QMainWindow):
         return False
 
     def handle_output(self, text, is_error):
+        scrollbar = self.output.verticalScrollBar()
+        at_bottom = scrollbar.value() >= scrollbar.maximum() - 10
+
         if is_error:
             self.output.setTextColor(QColor("#ff4444"))
             self.output.append(text)
@@ -579,9 +680,18 @@ class Terminal(QMainWindow):
             self._append_ls_line(text)
         else:
             self.output.append(text)
-        self.output.verticalScrollBar().setValue(
-            self.output.verticalScrollBar().maximum()
-        )
+
+        # Trim old lines if document gets too large (keep last 5000 lines)
+        doc = self.output.document()
+        max_lines = 5000
+        if doc.blockCount() > max_lines + 500:
+            cursor = self.output.textCursor()
+            cursor.movePosition(cursor.MoveOperation.Start)
+            cursor.movePosition(cursor.MoveOperation.Down, cursor.MoveMode.KeepAnchor, 500)
+            cursor.removeSelectedText()
+
+        if at_bottom:
+            scrollbar.setValue(scrollbar.maximum())
 
     def _append_ls_line(self, text):
         cursor = self.output.textCursor()
@@ -619,7 +729,14 @@ class Terminal(QMainWindow):
 
     def on_command_finished(self):
         self.thread = None
+        self._password_mode = False
+        self.input.setEchoMode(QLineEdit.EchoMode.Normal)
         self.input.setPlaceholderText(f"{self.cwd} $")
+
+    def _on_password_prompt(self):
+        self._password_mode = True
+        self.input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.input.setPlaceholderText("password...")
 
     def eventFilter(self, source, event):
         if source == self.input and event.type() == QEvent.Type.KeyPress:

@@ -47,13 +47,14 @@ class SSHThread(QThread):
     finished = Signal()
     error = Signal(str)
 
-    def __init__(self, host, user, port=22, key_path=None, password=None):
+    def __init__(self, host, user, port=22, key_path=None, password=None, screen_mode=False):
         super().__init__()
         self.host = host
         self.user = user
         self.port = port
         self.key_path = key_path
         self.password = password
+        self.screen_mode = screen_mode  # skip stty -echo, use larger scrollback
         self.client = None
         self.channel = None
         self._connected = False
@@ -77,9 +78,18 @@ class SSHThread(QThread):
 
             self.client.connect(**connect_kwargs)
 
-            # Open a persistent shell
+            # Open a persistent shell with echo disabled
             self.channel = self.client.invoke_shell(term="xterm", width=220, height=50)
             self.channel.settimeout(0.1)
+            import time
+            time.sleep(0.2)  # let shell settle
+            if not self.screen_mode:
+                # Disable remote echo so input isn't echoed back
+                self.channel.send("stty -echo\n")
+                time.sleep(0.1)
+                # Flush the stty command echo from buffer
+                while self.channel.recv_ready():
+                    self.channel.recv(1024)
             # Enable keepalive every 30 seconds
             self.client.get_transport().set_keepalive(30)
             self._connected = True
@@ -100,9 +110,10 @@ class SSHThread(QThread):
 
     def _read_loop(self):
         buffer = ""
+        recv_size = 65536 if self.screen_mode else 4096
         while self._running:
             try:
-                chunk = self.channel.recv(4096).decode("utf-8", errors="replace")
+                chunk = self.channel.recv(recv_size).decode("utf-8", errors="replace")
                 if chunk:
                     buffer += chunk
                     while "\n" in buffer:
@@ -126,8 +137,17 @@ class SSHThread(QThread):
 
     def _strip_ansi(self, text):
         import re
-        # Strip all ANSI/VT100 escape sequences including bracketed paste mode
-        ansi_escape = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\r')
+        # Strip all ANSI/VT100/screen escape sequences
+        ansi_escape = re.compile(
+            r'\x1b\[[0-9;?]*[a-zA-Z]'   # CSI sequences: ESC [ ... letter
+            r'|\x1b\][^\x07\x1b]*[\x07\x1b]'  # OSC sequences: ESC ] ... BEL/ESC
+            r'|\x1b[()][AB012]'          # Character set sequences
+            r'|\x1b[=>]'                 # Keypad mode
+            r'|\x1b[a-zA-Z]'            # Single char sequences
+            r'|\x07'                     # BEL
+            r'|\x08'                     # Backspace
+            r'|\r'                       # Carriage return
+        )
         text = ansi_escape.sub('', text)
         # Strip shell prompt (e.g. root@ubuntu-server:~#)
         text = re.sub(r'\S+@\S+:[^\$#]*[\$#]\s*', '', text)

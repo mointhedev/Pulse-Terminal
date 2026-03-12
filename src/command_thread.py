@@ -3,9 +3,11 @@ import pty
 import signal
 import select
 import re
+import termios
 from PySide6.QtCore import QThread, Signal
 
 ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][AB012]|\x1b[=>]|\r')
+PASSWORD_PROMPT = re.compile(r'(?i)(password\s*:|passphrase\s*:|enter password)')
 
 
 def strip_ansi(text):
@@ -14,6 +16,7 @@ def strip_ansi(text):
 
 class CommandThread(QThread):
     output_ready = Signal(str, bool)
+    password_prompt = Signal()
     finished = Signal()
 
     def __init__(self, cmd, cwd):
@@ -23,6 +26,7 @@ class CommandThread(QThread):
         self._master_fd = None
         self._pid = None
         self._running = True
+        self._last_input = None  # track last sent input to suppress echo
 
     def run(self):
         master_fd, slave_fd = pty.openpty()
@@ -33,8 +37,9 @@ class CommandThread(QThread):
             # Child process
             os.close(master_fd)
             os.setsid()
-            import fcntl, termios
-            fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+            import fcntl
+            import termios as _termios
+            fcntl.ioctl(slave_fd, _termios.TIOCSCTTY, 0)
             os.dup2(slave_fd, 0)
             os.dup2(slave_fd, 1)
             os.dup2(slave_fd, 2)
@@ -49,6 +54,11 @@ class CommandThread(QThread):
 
         # Parent process
         os.close(slave_fd)
+
+        # Disable echo on the master PTY so input isn't echoed back
+        attrs = termios.tcgetattr(master_fd)
+        attrs[3] &= ~termios.ECHO   # lflags: turn off ECHO
+        termios.tcsetattr(master_fd, termios.TCSANOW, attrs)
         buf = b''
         while self._running:
             try:
@@ -67,8 +77,31 @@ class CommandThread(QThread):
                 while b'\n' in buf:
                     line, buf = buf.split(b'\n', 1)
                     text = strip_ansi(line.decode('utf-8', errors='replace'))
-                    if text:
+                    if not text:
+                        continue
+                    # Suppress echo: drop lines that are just a prompt + what we typed
+                    if self._last_input is not None:
+                        stripped = text.lstrip('> ').lstrip('$ ').lstrip('% ')
+                        # Strip common REPL prompts: >>>, ..., $, >, %
+                        for prompt in ('>>> ', '... ', '$ ', '> ', '% '):
+                            if text.startswith(prompt):
+                                stripped = text[len(prompt):]
+                                break
+                        if stripped == self._last_input:
+                            self._last_input = None
+                            continue
+                    if PASSWORD_PROMPT.search(text):
                         self.output_ready.emit(text, False)
+                        self.password_prompt.emit()
+                    else:
+                        self.output_ready.emit(text, False)
+                # Also flush partial buffer if it looks like a prompt (no newline yet)
+                if buf:
+                    partial = strip_ansi(buf.decode('utf-8', errors='replace'))
+                    if PASSWORD_PROMPT.search(partial):
+                        self.output_ready.emit(partial.strip(), False)
+                        self.password_prompt.emit()
+                        buf = b''
             else:
                 # Check if child exited
                 result = os.waitpid(self._pid, os.WNOHANG)
@@ -98,6 +131,7 @@ class CommandThread(QThread):
         """Send text to the running process (for interactive input)."""
         if self._master_fd is not None:
             try:
+                self._last_input = text
                 os.write(self._master_fd, (text + '\n').encode())
             except OSError:
                 pass
