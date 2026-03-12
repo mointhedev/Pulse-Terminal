@@ -1,6 +1,7 @@
 # terminal.py
 import subprocess
 import os
+import re
 
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QMainWindow, QTextEdit, QLineEdit, QListWidget, QDialog, QLabel, QPushButton, QHBoxLayout, QLineEdit as QLE
 from PySide6.QtGui import QFont, QColor, QTextCharFormat, QKeyEvent
@@ -92,8 +93,9 @@ class Terminal(QMainWindow):
         self._detecting_distro = False
         self._distro_lines = []
         self._password_mode = False
-        self._screen_session = screen_session  # name of screen session if this is a screen window
-        self._spawn_ssh_info = ssh_info        # ssh credentials to auto-connect with
+        self._screen_session = screen_session
+        self._spawn_ssh_info = ssh_info
+        self._tab_just_fired = False
 
         if screen_session:
             self.setWindowTitle(f"screen: {screen_session}")
@@ -311,7 +313,7 @@ class Terminal(QMainWindow):
         if cmd.startswith("cd"):
             parts = cmd.split(maxsplit=1)
             path = parts[1] if len(parts) > 1 else os.path.expanduser("~")
-            path = os.path.expanduser(path)
+            path = os.path.expanduser(path.strip())
 
             if not os.path.isabs(path):
                 path = os.path.join(self.cwd, path)
@@ -379,7 +381,14 @@ class Terminal(QMainWindow):
         else:
             self._ls_mode = False
 
-        self.ssh_thread.send_command(cmd)
+        # Quote the path for cd so spaces don't break it on the server
+        if cmd.startswith("cd "):
+            path = cmd[3:].strip()
+            # Escape any single quotes in the path, then wrap in single quotes
+            safe_path = path.replace("'", "'\\''")
+            self.ssh_thread.send_command(f"cd '{safe_path}'")
+        else:
+            self.ssh_thread.send_command(cmd)
 
         # After cd, send pwd to update the placeholder
         if cmd.startswith("cd"):
@@ -740,6 +749,7 @@ class Terminal(QMainWindow):
 
     def eventFilter(self, source, event):
         if source == self.input and event.type() == QEvent.Type.KeyPress:
+            self._last_key = event.key()
             if event.key() == Qt.Key.Key_C and (event.modifiers() & Qt.KeyboardModifier.MetaModifier or event.modifiers() & Qt.KeyboardModifier.ControlModifier):
                 if self.ssh_thread and self.ssh_thread.is_connected():
                     self.ssh_thread.send_interrupt()
@@ -771,9 +781,12 @@ class Terminal(QMainWindow):
                     self.input.clear()
                 return True
             elif event.key() == Qt.Key.Key_Return:
-                if self.dropdown.isVisible() and self.dropdown.currentRow() >= 0:
-                    self.select_completion()
-                    return True
+                if self.dropdown.isVisible():
+                    if self.dropdown.currentRow() >= 0:
+                        self.select_completion()
+                    else:
+                        self.dropdown.hide()
+                    return True  # always block enter when dropdown is open
                 # Handle empty enter to skip pending save
                 if not self.input.text().strip() and self.ssh_info and hasattr(self,
                                                                                '_pending_save') and self._pending_save:
@@ -785,52 +798,173 @@ class Terminal(QMainWindow):
                     return True
                 return False
 
+            elif event.key() == Qt.Key.Key_Backspace:
+                self._last_key_backspace = True
+                self.dropdown.hide()
+                return False  # let Qt handle the actual deletion
             elif event.key() == Qt.Key.Key_Tab:
                 if self.dropdown.isVisible() and self.dropdown.currentRow() >= 0:
                     self.select_completion()
                     return True
-
-                # SSH tab completion
-                if self.ssh_info and self.ssh_thread:
-                    self.ssh_complete_tab()
-                    return True
-
-                text = self.input.text()
-                self.dropdown.clear()
-                self.dropdown.hide()
-
-                if not text.strip():
-                    return True
-                matches = glob.glob(os.path.join(self.cwd, text.split()[-1] + "*"))
-                if matches:
-                    if len(matches) == 1:
-                        completion = matches[0]
-                        completion = completion.split("/")[-1]
-                        partial = text.split()[-1]
-                        self.input.setText(text + completion[len(partial):])
-
-                    else:
-
-                        names = [m.split("/")[-1] for m in matches]
-                        self.dropdown.addItems(names)
-
-                        item_height = 19  # correct height per item
-                        dropdown_h = min(len(names), 6) * item_height
-                        self.dropdown.setFixedHeight(dropdown_h)  # set height FIRST
-                        self.dropdown.setFixedWidth(self.input.width())  # set width to match input
-                        input_rect = self.input.geometry()
-                        dropdown_x = input_rect.x()
-                        dropdown_y = input_rect.y() - dropdown_h - 1  # -1 for clean gap
-                        self.dropdown.move(dropdown_x, dropdown_y)
-                        self.dropdown.raise_()
-                        self.dropdown.show()
-
+                self.handle_tab()
                 return True
             elif event.key() == Qt.Key.Key_Escape:
                 if self.dropdown.isVisible():
                     self.dropdown.hide()
                     return True
         return super().eventFilter(source, event)
+
+    # ── Autocomplete ──────────────────────────────────────────────────────────
+
+    def handle_tab(self):
+        if self.ssh_info and self.ssh_thread:
+            self._tab_ssh()
+        else:
+            self._tab_local()
+
+    def _local_matches(self, last_word):
+        """Return sorted list of (display_name, full_path) for last_word."""
+        if os.path.isabs(last_word) or last_word.startswith("~"):
+            search_base = os.path.expanduser(last_word)
+        else:
+            search_base = os.path.join(self.cwd, last_word)
+        if search_base.endswith("/"):
+            pattern = search_base + "*"
+        else:
+            parent_dir = os.path.dirname(search_base)
+            base = os.path.basename(search_base)
+            pattern = os.path.join(parent_dir, glob.escape(base)) + "*"
+        matches = sorted(glob.glob(pattern))
+        results = []
+        for m in matches:
+            name = os.path.basename(m)  # no trailing slash — user types / themselves
+            results.append((name, m))
+        return results
+
+    def _apply_local(self, input_text, chosen_name):
+        """Apply chosen_name to input_text. No escaping — spaces kept as-is."""
+        parts = input_text.split(None, 1)
+        cmd = parts[0]
+        last_word = parts[1] if len(parts) > 1 else ""
+        typed_parent = last_word[:last_word.rfind("/") + 1] if "/" in last_word else ""
+        completed = typed_parent + chosen_name
+        return f"{cmd} {completed}"
+
+    def _tab_local(self):
+        text = self.input.text()
+        if not text.strip():
+            return
+        parts = text.split(None, 1)
+        last_word = parts[1] if len(parts) > 1 else ""
+        matches = self._local_matches(last_word)
+        if not matches:
+            return
+        if len(matches) == 1:
+            self.input.setText(self._apply_local(text, matches[0][0]))
+            self.dropdown.hide()
+        else:
+            self.show_dropdown([m[0] for m in matches])
+
+    def _tab_ssh(self, from_typing=False):
+        text = self.input.text()
+        if not text.strip():
+            return
+        parts = text.split(maxsplit=1)
+        last_word = parts[1] if len(parts) > 1 else ""
+        if last_word.endswith("/"):
+            ls_path = last_word
+        elif "/" in last_word:
+            ls_path = "/".join(last_word.split("/")[:-1]) + "/"
+        else:
+            ls_path = "./"
+        self._ssh_tab_partial = last_word
+        self._ssh_tab_text = text
+        self._ssh_tab_results = []
+        self._collecting_tab = True
+        self._ssh_tab_from_typing = from_typing
+        self.ssh_thread.output_ready.disconnect(self.handle_output)
+        self.ssh_thread.output_ready.connect(self._collect_ssh_tab)
+        safe_ls_path = ls_path.replace("'", "'\\''")
+        self.ssh_thread.send_command(f"ls -1p '{safe_ls_path}' 2>/dev/null")
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(800, lambda: self._finish_ssh_tab(from_typing=self._ssh_tab_from_typing))
+
+    def _collect_ssh_tab(self, text, is_error):
+        if not self._collecting_tab:
+            return
+        for line in text.splitlines():
+            raw = line.strip().rstrip("/")
+            if not raw:
+                continue
+            # Skip the echoed command line
+            if "ls -1p" in raw or "2>/dev/null" in raw:
+                continue
+            # Linux ls wraps names with spaces in single quotes — strip them
+            if raw.startswith("'") and raw.endswith("'"):
+                raw = raw[1:-1]
+            if raw:
+                self._ssh_tab_results.append(raw)
+
+    def _finish_ssh_tab(self, from_typing=False):
+        self._collecting_tab = False
+        self.ssh_thread.output_ready.disconnect(self._collect_ssh_tab)
+        self.ssh_thread.output_ready.connect(self.handle_output)
+        last_word = self._ssh_tab_partial
+        last_component = last_word.split("/")[-1]
+        typed_parent = last_word[:last_word.rfind("/") + 1] if "/" in last_word else ""
+        names = [n for n in self._ssh_tab_results if n.startswith(last_component)]
+        if not names:
+            if self._ssh_tab_partial.endswith("/"):
+                self.show_dropdown(["(empty)"])
+            return
+        if len(names) == 1 and not from_typing:
+            cmd = self._ssh_tab_text.split()[0]
+            self.input.setText(f"{cmd} {typed_parent}{names[0]}")
+        elif len(names) >= 2 or from_typing:
+            self.show_dropdown(names)
+
+    def update_dropdown(self, text):
+        """Live dropdown as user types. NEVER auto-completes — only Tab does that."""
+        if getattr(self, '_tab_just_fired', False):
+            return
+
+        # If last key was backspace and text ends with '/', don't trigger — user is erasing
+        if getattr(self, '_last_key_backspace', False):
+            self._last_key_backspace = False
+            if text.endswith("/"):
+                self.dropdown.hide()
+                return
+            # Any other character after backspace — fall through normally
+        
+        if self.ssh_info and self.ssh_thread:
+            parts = text.split(None, 1)
+            if len(parts) < 2:
+                self.dropdown.hide()
+                return
+            last_word = parts[1]
+            prev = getattr(self, '_prev_input', '')
+            self._prev_input = text
+            # Only fire SSH lookup when user actively typed a '/' (text grew)
+            if last_word.endswith("/") and len(text) > len(prev):
+                self._tab_ssh(from_typing=True)
+            else:
+                self.dropdown.hide()
+            return
+        self._prev_input = text
+        # Local — show dropdown for 2+ matches only, never auto-complete
+        parts = text.split(None, 1)
+        if len(parts) < 2:
+            self.dropdown.hide()
+            return
+        last_word = parts[1]
+        matches = self._local_matches(last_word)
+        if not matches:
+            if last_word.endswith("/"):
+                self.show_dropdown(["(empty)"])
+            else:
+                self.dropdown.hide()
+            return
+        self.show_dropdown([m[0] for m in matches])
 
     def show_dropdown(self, names):
         self.dropdown.clear()
@@ -844,152 +978,16 @@ class Terminal(QMainWindow):
         self.dropdown.raise_()
         self.dropdown.show()
 
-    def ssh_complete_tab(self):
-        text = self.input.text()
-        if not text.strip():
-            return
-
-        parts = text.split(maxsplit=1)
-        last_word = parts[1] if len(parts) > 1 else ""
-
-        # Build ls command for the partial path
-        if last_word.endswith("/"):
-            ls_path = last_word
-        elif "/" in last_word:
-            ls_path = "/".join(last_word.split("/")[:-1]) + "/"
-        else:
-            ls_path = "./"
-
-        # Run ls on remote and collect results
-        self._ssh_tab_partial = last_word
-        self._ssh_tab_text = text
-        self._ssh_tab_results = []
-        self._collecting_tab = True
-
-        # Temporarily intercept output
-        self.ssh_thread.output_ready.disconnect(self.handle_output)
-        self.ssh_thread.output_ready.connect(self._collect_ssh_tab)
-        self.ssh_thread.send_command(f"ls -1 {ls_path} 2>/dev/null")
-
-        # After short delay, process results
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(800, self._finish_ssh_tab)
-
-    def _collect_ssh_tab(self, text, is_error):
-        if self._collecting_tab and text.strip():
-            for line in text.splitlines():
-                raw = line.strip()
-                if not raw:
-                    continue
-                # Strip Linux ls quoting: 'name with spaces'
-                if raw.startswith("'") and "'" in raw[1:]:
-                    item = raw[1:raw.rindex("'")]
-                elif raw.startswith('"') and '"' in raw[1:]:
-                    item = raw[1:raw.rindex('"')]
-                else:
-                    item = raw.rstrip("/")
-                if item:
-                    self._ssh_tab_results.append(item)
-
-    def _finish_ssh_tab(self):
-        self._collecting_tab = False
-        self.ssh_thread.output_ready.disconnect(self._collect_ssh_tab)
-        self.ssh_thread.output_ready.connect(self.handle_output)
-
-        last_word = self._ssh_tab_partial
-        last_component = last_word.split("/")[-1]
-        prefix = "/".join(last_word.split("/")[:-1])
-        if prefix:
-            prefix += "/"
-
-        # Filter by what user has typed so far
-        names = [n for n in self._ssh_tab_results if n.startswith(last_component)]
-
-        if not names:
-            return
-
-        if len(names) == 1:
-            parts_list = self._ssh_tab_text.split()
-            completed = prefix + names[0]
-            # Quote if spaces in name
-            if " " in completed:
-                completed = f'"{completed}"'
-            parts_list[-1] = completed
-            self.input.setText(" ".join(parts_list))
-            return
-
-        self.show_dropdown(names)
-
-    def update_dropdown(self, text):
-
-        if self.ssh_info:
-            self.dropdown.hide()
-            return
-
-        
-        self.dropdown.clear()
-
-
-        if not text.strip() or len(text.split()) < 2:
-            self.dropdown.hide()
-            return
-
-        parts = text.split()
-        # Rejoin path parts — last word is everything after the command
-        last_word = parts[-1] if len(parts) <= 2 else " ".join(parts[1:])
-
-        if not (last_word.startswith(("./", "/", "~", "../")) or "/" in last_word) and not self.dropdown.isVisible():
-            self.dropdown.hide()
-            return
-
-        # Fix: resolve path correctly without os.path.join breaking on spaces
-        if os.path.isabs(last_word) or last_word.startswith("~"):
-            search_base = os.path.expanduser(last_word)
-        else:
-            search_base = os.path.join(self.cwd, last_word)
-
-        # Escape spaces so glob doesn't treat them as separators
-        escaped = glob.escape(search_base.rstrip("*"))
-        pattern = escaped + "*"
-        matches = glob.glob(pattern)
-
-        if not matches:
-            self.dropdown.hide()
-            return
-
-        names = [os.path.basename(m) for m in matches]
-        last_component = last_word.split("/")[-1]
-
-        # Hide if single exact match — nothing left to complete
-        if len(matches) == 1 and names[0] == last_component:
-            self.dropdown.hide()
-            return
-
-        self.dropdown.addItems(names)
-        item_height = 19
-        dropdown_h = min(len(names), 6) * item_height
-        self.dropdown.setFixedHeight(dropdown_h)
-        self.dropdown.setFixedWidth(self.input.width())
-        input_rect = self.input.geometry()
-        self.dropdown.move(input_rect.x(), input_rect.y() - dropdown_h - 1)
-        self.dropdown.raise_()
-        self.dropdown.show()
-
     def select_completion(self):
         item = self.dropdown.currentItem()
-        if not item:
+        if not item or item.text() == "(empty)":
+            self.dropdown.hide()
             return
-        text = self.input.text()
-        parts = text.split()
-        last_word = parts[-1]
-        parent = "/".join(last_word.split("/")[:-1])
-        completed = (parent + "/" + item.text()) if parent else item.text()
-        # Quote if spaces in name
-        if " " in completed:
-            completed = f'"{completed}"'
-        parts[-1] = completed
-        self.input.setText(" ".join(parts))
+        self.input.setText(self._apply_local(self.input.text(), item.text()))
         self.dropdown.hide()
+
+    # ── End Autocomplete ──────────────────────────────────────────────────────
+
 
     def _do_clear(self):
         self.output.clear()
