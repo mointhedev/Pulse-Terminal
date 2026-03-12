@@ -105,7 +105,6 @@ class Terminal(QMainWindow):
         self.setAcceptDrops(True)
         self.setStyleSheet("background-color: #0d0d0d;")
 
-
         self.central = QWidget()
         self.setCentralWidget(self.central)
         self.dropdown = QListWidget(self.central)
@@ -140,7 +139,6 @@ class Terminal(QMainWindow):
             }
         """)
         self.dropdown.hide()
-
 
 
         layout = QVBoxLayout(self.central)
@@ -184,7 +182,7 @@ class Terminal(QMainWindow):
         cursor = self.output.textCursor()
         if not screen_session:
             cursor.setCharFormat(bold_format)
-            cursor.insertText("Pulse Terminal v0.1 ⚡\n")
+            cursor.insertText("Pulse Terminal v1.0 ⚡\n")
         self.output.setTextCursor(cursor)
 
         default_format = QTextCharFormat()
@@ -237,7 +235,6 @@ class Terminal(QMainWindow):
                 self.input.setPlaceholderText("input...")
             self.thread.send_input(text)
             self.input.clear()
-            return
             return
 
         # If connected via SSH, handle save prompt or route to remote
