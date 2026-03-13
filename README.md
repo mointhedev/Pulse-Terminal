@@ -15,7 +15,7 @@ A modern, minimal, dark GUI terminal built from scratch in Python using PySide6 
 - Command history with arrow key navigation
 - sudo password masking
 
-![CD Navigation Demo](assets/demo.gif)
+<img src="assets/cd-demo.gif" width="600"/>
 
 ### SSH
 - Connect via `ssh user@host` or saved nicknames
@@ -27,8 +27,7 @@ A modern, minimal, dark GUI terminal built from scratch in Python using PySide6 
 - `download <name>` — download a file or folder from the server
 - Conflict resolution on all transfers (overwrite / rename / skip)
 
-![SSH Features Demo](assets/ssh-features.gif)
-
+<img src="assets/ssh-features.gif" width="600"/>
 
 ### Screen Sessions
 - `screen start <name>` — start a named session in a new window
