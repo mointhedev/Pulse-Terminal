@@ -1,10 +1,9 @@
 # terminal.py
-import subprocess
+
 import os
-import re
 
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QMainWindow, QTextEdit, QLineEdit, QListWidget, QDialog, QLabel, QPushButton, QHBoxLayout, QLineEdit as QLE
-from PySide6.QtGui import QFont, QColor, QTextCharFormat, QKeyEvent
+from PySide6.QtGui import QFont, QColor, QTextCharFormat
 from PySide6.QtCore import Qt, QEvent
 import glob
 
@@ -29,7 +28,7 @@ class ConflictDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
-        self._label = QLabel(f'"{filename}" already exists on the server.\nWhat would you like to do?')
+        self._label = QLabel(f'"{filename}" already exists at the destination.\nWhat would you like to do?')
         layout.addWidget(self._label)
 
         self._name_input = QLE(filename)

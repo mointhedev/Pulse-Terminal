@@ -295,6 +295,10 @@ class DownloadThread(QThread):
                 last_pct[0] = pct
                 self.progress.emit(f"Downloading... {pct}%")
         sftp.get(remote_path, local_path, callback=on_progress)
+        # Update timestamps so Finder shows it as most recently modified
+        import time
+        now = time.time()
+        os.utime(local_path, (now, now))
 
     def _download_dir(self, sftp, remote_dir, local_base, folder_name):
         import stat as stat_mod
